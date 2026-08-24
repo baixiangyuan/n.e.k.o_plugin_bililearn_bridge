@@ -17,16 +17,16 @@ import json
 import os
 import shutil
 import webbrowser
-from typing import Any, Optional
+from typing import Any
 
 from plugin.sdk.plugin import (
+    Err,
     NekoPluginBase,
+    Ok,
+    SdkError,
+    lifecycle,
     neko_plugin,
     plugin_entry,
-    lifecycle,
-    Ok,
-    Err,
-    SdkError,
 )
 
 PLUGIN_ID = "bililearn_bridge"
@@ -48,7 +48,7 @@ class BiliLearnBridgePlugin(NekoPluginBase):
         self.launch_mode: str = "serve"
         self.auto_launch: bool = True
         # 由本插件拉起的子进程句柄（仅当我们自己启动的才负责停止）
-        self._proc: Optional[asyncio.subprocess.Process] = None
+        self._proc: asyncio.subprocess.Process | None = None
 
     # ------------------------------------------------------------------ #
     # 生命周期
@@ -91,7 +91,7 @@ class BiliLearnBridgePlugin(NekoPluginBase):
     def _url(self) -> str:
         return f"http://127.0.0.1:{self.port}"
 
-    def _resolve_exe(self) -> Optional[str]:
+    def _resolve_exe(self) -> str | None:
         """按 配置路径 -> PATH -> 常见构建/安装位置 顺序定位 exe。"""
         if self.exe_path:
             p = shutil.which(self.exe_path) or self.exe_path
@@ -182,8 +182,8 @@ class BiliLearnBridgePlugin(NekoPluginBase):
     def _request(self, method: str, path: str, *, json_body: Any = None,
                  timeout: float = 10.0) -> dict:
         """同步请求 BiliLearn Web API，返回统一结构。"""
-        import urllib.request
         import urllib.error
+        import urllib.request
 
         url = f"{self._url()}{path}"
         data = None

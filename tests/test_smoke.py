@@ -4,9 +4,10 @@ Tests plugin.toml schema without importing the plugin runtime, so it stays
 green under both `unittest` and `pytest` even before the N.E.K.O SDK is present.
 """
 
-import tomllib
 import unittest
 from pathlib import Path
+
+import tomllib
 
 PLUGIN_TOML = Path(__file__).resolve().parent.parent / "plugin.toml"
 ENTRY_MODULE = Path(__file__).resolve().parent.parent / "bililearn_bridge.py"
