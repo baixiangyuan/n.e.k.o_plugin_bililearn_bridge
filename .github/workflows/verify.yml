@@ -10,11 +10,11 @@ permissions:
 
 jobs:
   market_verify:
-    uses: Project-N-E-K.O/N.E.K.O/.github/workflows/plugin-market-verify.yml@main
+    uses: Project-N-E-K.O/N.E.K.O/.github/workflows/plugin-market-verify.yml@fb78210ada6727ac9c5b3cb0376e5014ac4b1650
     with:
       plugin-id: bililearn_bridge
       neko-repository: Project-N-E-K-O/N.E.K.O
-      neko-ref: main
+      neko-ref: fb78210ada6727ac9c5b3cb0376e5014ac4b1650
 
   verify:
     runs-on: ubuntu-latest
