@@ -15,9 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import shlex
 import shutil
-import sys
 import webbrowser
 from typing import Any, Optional
 
