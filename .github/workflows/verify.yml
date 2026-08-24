@@ -1,0 +1,16 @@
+name: Verify Plugin
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        run: pip install uv
+      - name: Verify plugin package
+        run: uv run neko-plugin verify .
