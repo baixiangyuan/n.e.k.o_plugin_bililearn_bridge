@@ -13,7 +13,7 @@ jobs:
     uses: Project-N-E-K.O/N.E.K.O/.github/workflows/plugin-market-verify.yml@main
     with:
       plugin-id: bililearn_bridge
-      neko-repository: baixiangyuan/N.E.K.O
+      neko-repository: Project-N-E-K-O/N.E.K.O
       neko-ref: main
 
   verify:
