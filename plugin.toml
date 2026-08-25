@@ -6,7 +6,7 @@ description = "让 N.E.K.O 猫娘桥接独立的 BiliLearn（B站 AI 学习机�
 short_description = "猫娘的 BiliLearn 桥：拉起独立程序并控制它。"
 keywords = ["bilibili", "b站", "学习", "bililearn", "bridge", "桥接", "机器人", "video"]
 version = "1.0.0"
-entry = "bililearn_bridge:BiliLearnBridgePlugin"
+entry = "plugin.plugins.bililearn_bridge:BiliLearnBridgePlugin"
 
 [plugin.author]
 name = "WorkBuddy"

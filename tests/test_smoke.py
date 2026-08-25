@@ -9,7 +9,9 @@ import unittest
 from pathlib import Path
 
 PLUGIN_TOML = Path(__file__).resolve().parent.parent / "plugin.toml"
-ENTRY_MODULE = Path(__file__).resolve().parent.parent / "bililearn_bridge.py"
+# 运行时按 ``plugins.<id>`` 命名空间包导入（见 N.E.K.O host.py / entry_points.py），
+# 入口类由插件包 ``__init__.py`` re-export，因此入口模块文件是 ``__init__.py``。
+ENTRY_MODULE = Path(__file__).resolve().parent.parent / "__init__.py"
 
 
 class TestPluginSmoke(unittest.TestCase):
@@ -21,7 +23,7 @@ class TestPluginSmoke(unittest.TestCase):
             data = tomllib.load(fh)
         plugin = data["plugin"]
         self.assertEqual(plugin["id"], "bililearn_bridge")
-        self.assertEqual(plugin["entry"], "bililearn_bridge:BiliLearnBridgePlugin")
+        self.assertEqual(plugin["entry"], "plugin.plugins.bililearn_bridge:BiliLearnBridgePlugin")
         self.assertEqual(plugin["type"], "plugin")
 
     def test_entry_module_exists(self):
