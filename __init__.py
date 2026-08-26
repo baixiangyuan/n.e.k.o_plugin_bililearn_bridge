@@ -59,7 +59,13 @@ class BiliLearnBridgePlugin(NekoPluginBase):
     # ------------------------------------------------------------------ #
     @lifecycle(id="startup")
     async def on_startup(self, **_) -> Any:
-        cfg = await self.config.dump()
+        # 配置读取：启动阶段 config 总线可能尚未完全就绪，限定超时并兜底默认值，
+        # 绝不让 startup 因 config 卡死而触发宿主 10s 超时。
+        try:
+            cfg = await self.config.dump(timeout=2.0)
+        except Exception as exc:
+            self.logger.warning("读取插件配置失败（回退默认值）: %s", exc)
+            cfg = {}
         bc = cfg.get(PLUGIN_ID) or {}
         self.exe_path = (bc.get("exe_path") or "").strip()
         self.port = int(bc.get("port") or DEFAULT_PORT)
@@ -73,16 +79,24 @@ class BiliLearnBridgePlugin(NekoPluginBase):
             )
             return Ok({"status": "no_exe", "auto_launch": self.auto_launch})
 
-        if self.auto_launch:
-            # 若已在运行则直接附接，不重复拉起
-            if await self._is_healthy():
-                self.logger.info("检测到 BiliLearn 已在运行，直接附接（port=%s）", self.port)
-                return Ok({"status": "attached", "port": self.port, "url": self._url()})
-            launched = await self._launch(exe)
-            if launched:
-                return Ok({"status": "started", "port": self.port, "url": self._url()})
-            return Err(SdkError("BiliLearn 启动失败，请检查 exe 路径与日志。"))
-        return Ok({"status": "idle", "exe_found": True, "port": self.port})
+        if not self.auto_launch:
+            return Ok({"status": "idle", "exe_found": True, "port": self.port})
+
+        # 已在运行则直接附接，不重复拉起
+        if await self._is_healthy():
+            self.logger.info("检测到 BiliLearn 已在运行，直接附接（port=%s）", self.port)
+            return Ok({"status": "attached", "port": self.port, "url": self._url()})
+
+        # 拉起 exe，但【不在 startup 内阻塞等待就绪】：N.E.K.O 给 startup 仅 10s 预算，
+        # 而 PyInstaller onefile 首次冷启动解包可能 >10s。改为：发起拉起后最多等待 budget
+        # 秒，即便未就绪也立即返回（后续由 start/status/open_panel 入口按需确认）。
+        if not await self._spawn(exe):
+            return Err(SdkError("BiliLearn 启动失败（无法拉起进程），请检查 exe 路径与日志。"))
+        ready = await self._wait_ready(2.0)
+        if ready:
+            return Ok({"status": "started", "port": self.port, "url": self._url()})
+        self.logger.info("BiliLearn 已发起拉起（pid=%s），仍在后台就绪中。", self._proc.pid)
+        return Ok({"status": "launching", "port": self.port, "url": self._url()})
 
     @lifecycle(id="shutdown")
     async def on_shutdown(self, **_) -> Any:
@@ -126,8 +140,8 @@ class BiliLearnBridgePlugin(NekoPluginBase):
             return False
         return bool(res.get("ok")) and res.get("status") == 200
 
-    async def _launch(self, exe: str) -> bool:
-        """以无头模式拉起 exe（serve=无头服务器，silent=无头无托盘）。"""
+    async def _spawn(self, exe: str) -> bool:
+        """以无头模式拉起 exe（立即返回，不等待就绪）。"""
         mode = self.launch_mode if self.launch_mode in ("serve", "silent") else "serve"
         env = os.environ.copy()
         env["WEB_PORT"] = str(self.port)
@@ -143,22 +157,33 @@ class BiliLearnBridgePlugin(NekoPluginBase):
                 stderr=asyncio.subprocess.DEVNULL,
                 creationflags=getattr(asyncio.subprocess, "CREATE_NO_WINDOW", 0),
             )
+            self.logger.info("已拉起 BiliLearn 子进程（pid=%s, mode=%s）", self._proc.pid, mode)
+            return True
         except (OSError, ValueError) as exc:
             self.logger.error("拉起 BiliLearn 失败: %s", exc)
+            self._proc = None
             return False
 
-        # 轮询健康端点，最多 30s
-        for _ in range(60):
+    async def _wait_ready(self, timeout: float = 30.0) -> bool:
+        """轮询健康端点直到就绪或超时（调用方自行保证不超预算）。"""
+        ticks = max(1, int(timeout / 0.5))
+        for _ in range(ticks):
             if await self._is_healthy():
-                self.logger.info("BiliLearn 已就绪（pid=%s）", self._proc.pid)
                 return True
-            if self._proc.returncode is not None:
-                self.logger.error("BiliLearn 子进程已退出（code=%s）", self._proc.returncode)
+            proc = self._proc
+            if proc is not None and proc.returncode is not None:
+                self.logger.error("BiliLearn 子进程已退出（code=%s）", proc.returncode)
                 self._proc = None
                 return False
             await asyncio.sleep(0.5)
-        self.logger.warning("BiliLearn 在 30s 内未就绪（可能端口被占用或依赖缺失）")
+        self.logger.warning("BiliLearn 在 %.0fs 内未就绪（可能端口被占用或依赖缺失）", timeout)
         return False
+
+    async def _launch(self, exe: str, wait: float = 30.0) -> bool:
+        """拉起 exe 并等待其就绪（供 start/restart 入口使用，预算充裕）。"""
+        if not await self._spawn(exe):
+            return False
+        return await self._wait_ready(wait)
 
     async def _stop_managed(self) -> None:
         """仅停止由本插件拉起的子进程；附接的已有实例不碰。"""
