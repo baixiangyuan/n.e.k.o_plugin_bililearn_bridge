@@ -6,8 +6,8 @@ auto_start = true
 
 # 插件自定义配置（运行时可通过 self.config.dump() 读取）
 [bililearn_bridge]
-# BiliLearn Web.exe 的绝对路径。留空即可：插件开箱即用——本地没装时自动用
-# 仓库自带安装包，或从 GitHub release 自动下载并解包到插件数据目录。
+# BiliLearn Web.exe 的绝对路径。留空即可：插件开箱即用——本地没装时自动从
+# GitHub release 下载安装包（多镜像源自动切换）并解包到插件数据目录。
 exe_path = ""
 # 本地找不到 BiliLearn 时，是否自动下载/解包安装包（默认 true，即开箱即用）
 auto_install = true

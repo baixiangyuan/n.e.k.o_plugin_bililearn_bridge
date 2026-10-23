@@ -41,6 +41,23 @@ RUNTIME_DIRNAME = "runtime"
 # 仓库自带的版本号（与 assets/ 下实际文件名保持一致）。
 BUNDLED_VERSION = "3.1.6"
 
+# 多镜像源：GitHub release 直连在国内经常超时/极慢，故按「快镜像 → 官方」顺序尝试，
+# 逐个失败自动切换下一个，全部失败才报错。每个模板用 {} 占位原始 URL。
+# 已实测（2026-10-23）：gh-proxy.com / ghfast.top / 官方均可返回真实内容；
+# ghproxy.net 超时、hub.gitmirror.com 与 github.moeyy.xyz 不可达，故不收录。
+# 顺序按实测速度排：gh-proxy.com 最快，放首位；官方直连作兜底（海外/无墙环境更快）。
+_DOWNLOAD_SOURCES: tuple[tuple[str, str], ...] = (
+    ("gh-proxy.com", "https://gh-proxy.com/{}"),
+    ("ghfast.top", "https://ghfast.top/{}"),
+    ("official", ""),
+)
+# 单个源的连接/读取超时（秒）：102MB 的文件在国内网络下需要更宽松的读取超时。
+_SOURCE_TIMEOUT = 180.0
+# 单源最大重试次数（应对偶发 reset）。
+_SOURCE_RETRIES = 2
+# 代理可用性探测用的轻量 URL（命中 CDN，体积小、稳定）。
+_PROBE_URL = "https://api.github.com/zen"
+
 _RELEASE_API = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
 _USER_AGENT = "n.e.k.o-plugin-bililearn-bridge"
 # 单块大小：1024 KiB，够快且内存占用可控。
@@ -218,19 +235,66 @@ def _asset_api_url() -> str:
     return f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
 
 
+def _system_proxy_usable(timeout: float = 4.0) -> bool:
+    """系统代理环境变量指向的代理是否真的能转发请求。
+
+    只测 TCP 连通是不够的：本机环境里 ``HTTPS_PROXY=http://127.0.0.1:7892``
+    的端口能 accept 连接，但通过它发请求仍然 ``WinError 10061``
+    （代理进程其实已经不出国了）。所以这里真的发一次最轻量的请求去试，
+    用毫秒级超时判定，避免在错误的策略上白等几十秒 SSL 超时。
+    """
+    proxies = urllib.request.getproxies()
+    if not any(proxies.get(scheme) for scheme in ("https", "http")):
+        return False
+    request = urllib.request.Request(_PROBE_URL, headers={"User-Agent": _USER_AGENT})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - 探测
+            return 200 <= response.status < 400
+    except urllib.error.HTTPError:
+        # 有 HTTP 响应就说明代理在工作（4xx/5xx 是目标站的问题，不是代理的问题）。
+        return True
+    except (OSError, urllib.error.URLError, ValueError):
+        return False
+
+
 def _http_get(url: str, timeout: float = 30.0) -> bytes:
+    """GET 一个 URL 并返回原始字节。
+
+    策略：系统代理可用就走代理，否则直连。反向也能跑通，但直连失败时
+    SSL 握手要等满超时才报错，在代理已死的机器上每个源都要白等一次，
+    所以先用一次毫秒级 TCP 探测决定走哪条路。
+    """
     request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT, "Accept": "*/*"})
-    with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - 固定 GitHub 域名
+    if _system_proxy_usable():
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - 固定域名
+            return response.read()
+    direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with direct.open(request, timeout=timeout) as response:  # noqa: S310 - 固定域名
         return response.read()
 
 
 def _release_metadata(timeout: float) -> dict[str, Any]:
-    """读取 latest release 元数据；失败时抛出 OSError 由上层降级处理。"""
-    raw = _http_get(_asset_api_url(), timeout=timeout)
-    data = json.loads(raw.decode("utf-8"))
-    if not isinstance(data, dict):
-        raise OSError("unexpected release metadata")
-    return data
+    """读取 latest release 元数据（同样走多镜像源，api.github.com 国内常被挡）。
+
+    失败时抛出 OSError 由上层降级处理。
+    """
+    url = _asset_api_url()
+    last_error: Exception | None = None
+    for source_name, candidate in _mirror_urls(url):
+        try:
+            raw = _http_get(candidate, timeout=timeout)
+        except (OSError, urllib.error.URLError) as exc:
+            last_error = exc
+            continue
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except ValueError as exc:
+            last_error = exc
+            continue
+        if isinstance(data, dict):
+            return data
+        last_error = OSError("unexpected release metadata")
+    raise OSError(f"无法读取 release 信息（已尝试全部源）：{last_error}")
 
 
 def _pick_installer_asset(metadata: dict[str, Any]) -> tuple[str, str, int] | None:
@@ -263,27 +327,95 @@ def _pick_checksum_asset(metadata: dict[str, Any]) -> str | None:
     return None
 
 
-def _download(url: str, target: Path, timeout: float) -> Path:
-    """流式下载到 target（先写 .part，完成后原子改名，避免半成品被当作可用）。"""
+def _mirror_urls(url: str) -> list[tuple[str, str]]:
+    """把原始 URL 展开成「源名 → 候选 URL」列表，官方源在最前。"""
+    return [(name, template.format(url) if template else url) for name, template in _DOWNLOAD_SOURCES]
+
+
+def _open_stream(url: str, timeout: float):
+    """打开一个下载流：系统代理可用就走代理，否则直连（同 :func:`_http_get`）。"""
+    request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
+    if _system_proxy_usable():
+        return urllib.request.urlopen(request, timeout=timeout)  # noqa: S310 - 镜像白名单
+    direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return direct.open(request, timeout=timeout)  # noqa: S310 - 镜像白名单
+
+
+def _download_one(
+    url: str,
+    target: Path,
+    timeout: float,
+    *,
+    logger: Any = None,
+    progress_every_mb: int = 25,
+) -> None:
+    """流式下载单个 URL 到 target（先写 .part，完成后原子改名）。
+
+    每 ``progress_every_mb`` MB 记一条日志：安装包上百 MB，国内网络下要几分钟，
+    没有进度输出时用户无法区分「在下载」和「卡死了」。
+    """
     target.parent.mkdir(parents=True, exist_ok=True)
     partial = target.with_suffix(target.suffix + ".part")
-    request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
-    with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - 固定 GitHub 域名
+    total = 0
+    next_report = progress_every_mb * 1024 * 1024
+    with _open_stream(url, timeout) as response:
         with partial.open("wb") as handle:
             while True:
                 chunk = response.read(_CHUNK)
                 if not chunk:
                     break
                 handle.write(chunk)
+                total += len(chunk)
+                if logger and total >= next_report:
+                    logger.info("已下载 %.0f MB …", total / 1048576)
+                    next_report = total + progress_every_mb * 1024 * 1024
     partial.replace(target)
-    return target
+    if logger:
+        logger.info("下载完成：%.1f MB", total / 1048576)
+
+
+def _download_via_mirrors(
+    url: str,
+    target: Path,
+    timeout: float,
+    *,
+    logger: Any = None,
+    on_source: Any = None,
+) -> tuple[bool, str]:
+    """依次尝试各镜像源下载，任一成功即返回。
+
+    返回 ``(是否成功, 说明)``；说明里带上每个源的失败原因，便于排查。
+    """
+    attempts: list[str] = []
+    for source_name, candidate in _mirror_urls(url):
+        for attempt in range(1, _SOURCE_RETRIES + 1):
+            suffix = f" 第{attempt}次" if attempt > 1 else ""
+            if logger:
+                logger.info("尝试从 %s 下载%s…", source_name, suffix)
+            if on_source:
+                on_source(source_name)
+            try:
+                _download_one(candidate, target, timeout, logger=logger)
+                return True, source_name
+            except (OSError, urllib.error.URLError, ValueError) as exc:
+                reason = str(exc) or exc.__class__.__name__
+                attempts.append(f"{source_name}{suffix}: {reason[:80]}")
+                if logger:
+                    logger.warning("%s 下载失败%s：%s", source_name, suffix, reason[:120])
+                target.with_suffix(target.suffix + ".part").unlink(missing_ok=True)
+    return False, "；".join(attempts)
 
 
 def _verify_against_sums(target: Path, sums_url: str, timeout: float) -> bool:
     """有 SHA256SUMS.txt 就校验；没有则跳过（返回 True）。"""
-    try:
-        text = _http_get(sums_url, timeout=timeout).decode("utf-8", "replace")
-    except (OSError, urllib.error.URLError):
+    text = ""
+    for source_name, candidate in _mirror_urls(sums_url):
+        try:
+            text = _http_get(candidate, timeout=timeout).decode("utf-8", "replace")
+            break
+        except (OSError, urllib.error.URLError):
+            continue
+    if not text:
         return True
     expected = ""
     for line in text.splitlines():
@@ -296,10 +428,16 @@ def _verify_against_sums(target: Path, sums_url: str, timeout: float) -> bool:
     return _sha256_of(target).lower() == expected
 
 
-def download_installer(state_dir: Path | None, timeout: float = 60.0) -> tuple[Path | None, str]:
-    """从 GitHub latest release 下载安装包。
+def download_installer(
+    state_dir: Path | None,
+    timeout: float = 60.0,
+    *,
+    logger: Any = None,
+    on_source: Any = None,
+) -> tuple[Path | None, str]:
+    """从 GitHub latest release 下载安装包（多镜像源自动切换）。
 
-    返回 ``(路径, 说明)``；失败时路径为 ``None``，说明里带上原因，
+    返回 ``(路径, 说明)``；失败时路径为 ``None``，说明里带上每个源的失败原因，
     由调用方降级到「本地扫描」并如实告知用户。
     """
     cache = _cache_dir(state_dir)
@@ -315,19 +453,30 @@ def download_installer(state_dir: Path | None, timeout: float = 60.0) -> tuple[P
     try:
         if target.is_file() and target.stat().st_size == size:
             return target, f"复用缓存：{name}"
-        _download(url, target, timeout=timeout)
+    except OSError:
+        pass
+
+    effective = max(timeout, _SOURCE_TIMEOUT)
+    ok, note = _download_via_mirrors(
+        url, target, effective, logger=logger, on_source=on_source
+    )
+    if not ok:
+        target.unlink(missing_ok=True)
+        return None, f"所有下载源均失败（{note}）"
+    try:
         if size and target.stat().st_size != size:
             target.unlink(missing_ok=True)
             return None, "下载文件大小与 release 不符，已丢弃"
-    except (OSError, urllib.error.URLError) as exc:
+    except OSError as exc:
         target.unlink(missing_ok=True)
-        return None, f"下载失败：{exc}"
+        return None, f"下载后校验失败：{exc}"
+
     sums_url = _pick_checksum_asset(metadata)
     if sums_url and not _verify_against_sums(target, sums_url, timeout=timeout):
         target.unlink(missing_ok=True)
         return None, "SHA256 校验未通过，已丢弃"
     version = _version_from_name(name)
-    return target, f"已下载 {name}（{version}）"
+    return target, f"已下载 {name}（{version}，来源 {note}）"
 
 
 def _find_exe_in(tree: Path, max_depth: int = 4) -> Path | None:

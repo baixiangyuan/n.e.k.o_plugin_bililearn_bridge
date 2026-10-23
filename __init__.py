@@ -273,36 +273,37 @@ class BiliLearnBridgePlugin(NekoPluginBase):
 
     def _install_blocking(self, state_dir: Path | None) -> str | None:
         """同步执行「取得安装包 -> 解包 -> 返回 exe」。在工作线程中调用。"""
-        # 1) 仓库自带的分卷安装包（GitHub 单文件 100MB 上限下的形态，离线可用）
-        bundled = installer.reassemble_bundled(self.plugin_dir, state_dir, logger=self.logger)
-        if bundled:
-            self.logger.info("使用仓库自带的 BiliLearn 安装包：%s", bundled.name)
-            exe = installer.ensure_runtime_exe(bundled, state_dir, logger=self.logger)
-            if exe:
-                return str(exe)
-        # 1b) 未分卷时的整包自带（小版本或本地调试形态）
-        whole = installer.find_bundled_installer(self.plugin_dir)
-        if whole:
-            self.logger.info("使用仓库自带的 BiliLearn 安装包：%s", whole.name)
-            exe = installer.ensure_runtime_exe(whole, state_dir, logger=self.logger)
-            if exe:
-                return str(exe)
-        # 2) 本地缓存（之前下载过）
+        # 1) 本地缓存（之前下载/拼接过）
         cached = installer.find_cached_installer(state_dir)
         if cached:
             self.logger.info("使用已缓存的 BiliLearn 安装包：%s", cached.name)
             exe = installer.ensure_runtime_exe(cached, state_dir, logger=self.logger)
             if exe:
                 return str(exe)
-        # 3) 自动从 GitHub latest release 下载
-        self.logger.info("本地没有 BiliLearn，开始自动下载最新版 …")
-        downloaded, note = installer.download_installer(state_dir, timeout=max(60.0, self.request_timeout * 3))
-        if not downloaded:
+        # 2) 自动从 GitHub release 下载（多镜像源自动切换）
+        self.logger.info("本地没有 BiliLearn，开始自动下载最新版（多镜像源）…")
+        downloaded, note = installer.download_installer(
+            state_dir,
+            timeout=max(60.0, self.request_timeout * 3),
+            logger=self.logger,
+        )
+        if downloaded:
+            self.logger.info("%s", note)
+            exe = installer.ensure_runtime_exe(downloaded, state_dir, logger=self.logger)
+            if exe:
+                return str(exe)
+        else:
             self.logger.error("自动下载 BiliLearn 失败：%s", note)
-            return None
-        self.logger.info("%s", note)
-        exe = installer.ensure_runtime_exe(downloaded, state_dir, logger=self.logger)
-        return str(exe) if exe else None
+        # 3) 仓库自带的安装包（若附带：分卷或整包）
+        bundled = installer.reassemble_bundled(self.plugin_dir, state_dir, logger=self.logger)
+        if not bundled:
+            bundled = installer.find_bundled_installer(self.plugin_dir)
+        if bundled:
+            self.logger.info("使用仓库自带的 BiliLearn 安装包：%s", bundled.name)
+            exe = installer.ensure_runtime_exe(bundled, state_dir, logger=self.logger)
+            if exe:
+                return str(exe)
+        return None
 
     @staticmethod
     def _find_exe_under(root: Path, depth: int) -> Path | None:

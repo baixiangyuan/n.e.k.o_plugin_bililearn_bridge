@@ -452,6 +452,84 @@ class TestInstaller(unittest.TestCase):
             (plugin_dir / "assets").mkdir(parents=True)
             self.assertIsNone(self.installer.reassemble_bundled(plugin_dir, Path(tmp) / "s"))
 
+    def test_mirror_urls_start_with_fastest(self):
+        urls = self.installer._mirror_urls("https://github.com/o/r/releases/download/v1/f.zip")  # noqa: SLF001
+        names = [name for name, _ in urls]
+        # Fastest measured mirror first; official stays in the list as fallback.
+        self.assertEqual(names[0], "gh-proxy.com")
+        self.assertIn("official", names)
+        # The official entry must be the raw URL, unwrapped.
+        for name, candidate in urls:
+            if name == "official":
+                self.assertEqual(candidate, "https://github.com/o/r/releases/download/v1/f.zip")
+            else:
+                self.assertIn("https://github.com/o/r/releases/download/v1/f.zip", candidate, name)
+                self.assertTrue(candidate.startswith("https://"), name)
+
+    def test_mirror_fallback_uses_next_source(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state"
+            state.mkdir()
+            target = state / "payload.bin"
+            seen: list[str] = []
+
+            def fake_download(url: str, dest: Path, timeout: float, **kwargs) -> None:
+                # Only the raw official URL (no mirror prefix) succeeds.
+                if url.startswith("https://github.com/"):
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    dest.write_bytes(b"ok")
+                    return
+                raise OSError("connection reset")
+
+            original = self.installer._download_one  # noqa: SLF001 - tooling check
+            self.installer._download_one = fake_download  # type: ignore[assignment]
+            try:
+                ok, note = self.installer._download_via_mirrors(  # noqa: SLF001
+                    "https://github.com/o/r/releases/download/v1/f.zip",
+                    target,
+                    5.0,
+                    on_source=seen.append,
+                )
+            finally:
+                self.installer._download_one = original  # type: ignore[assignment]
+
+            self.assertTrue(ok)
+            self.assertEqual(note, "official")
+            # Sources are tried in order, each retried before moving on.
+            self.assertEqual(seen[0], "gh-proxy.com")
+            self.assertEqual(seen[-1], "official")
+            self.assertLess(seen.index("ghfast.top"), seen.index("official"))
+            self.assertEqual(target.read_bytes(), b"ok")
+            # No half-finished .part may survive a failed source.
+            self.assertFalse(target.with_suffix(".bin.part").exists())
+
+    def test_download_gives_up_after_all_sources(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state"
+            state.mkdir()
+            original = self.installer._download_one  # noqa: SLF001 - tooling check
+
+            def always_fail(url: str, dest: Path, timeout: float, **kwargs) -> None:
+                raise OSError("timed out")
+
+            self.installer._download_one = always_fail  # type: ignore[assignment]
+            try:
+                ok, note = self.installer._download_via_mirrors(  # noqa: SLF001
+                    "https://github.com/o/r/releases/download/v1/f.zip",
+                    state / "payload.bin",
+                    5.0,
+                )
+            finally:
+                self.installer._download_one = original  # type: ignore[assignment]
+
+            self.assertFalse(ok)
+            for name, _ in self.installer._DOWNLOAD_SOURCES:  # noqa: SLF001
+                self.assertIn(name, note)
+
 
 if __name__ == "__main__":
     unittest.main()

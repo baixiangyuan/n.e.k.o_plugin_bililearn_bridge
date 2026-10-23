@@ -7,8 +7,7 @@
 插件按下面的顺序自动搞定 BiliLearn：
 
 1. **本地已装** → 直接用（含之前自己解包的运行时）；
-2. **仓库自带安装包** → 解包到插件数据目录（随插件附带，离线可用）；
-3. **自动下载** → 从 GitHub release 拉最新版（带 SHA256 校验）后解包。
+2. **自动下载** → 从 GitHub release 拉最新版（**多镜像源自动切换**，带 SHA256 校验）后解包。
 
 之后以无头模式（`--serve`）拉起，**不弹面板、不建系统托盘**；
 已在运行则直接附接，绝不重复拉起。
@@ -62,7 +61,7 @@
 
 ```toml
 [bililearn_bridge]
-exe_path = ""            # 一般留空：插件自动取得 BiliLearn（自带包/下载/本地）
+exe_path = ""            # 一般留空：插件自动取得 BiliLearn（本地/自动下载）
 auto_install = true      # 本地没有时是否自动下载解包（false 则只找本地）
 port = 18083             # 面板端口（插件会优先读账户注册表里的真实端口）
 launch_mode = "serve"    # serve=无头服务器; silent=无头无托盘
@@ -78,26 +77,31 @@ request_timeout = 20     # 单请求超时（秒）
 
 无。默认配置即可开箱即用。仅以下情况需要手动干预：
 
-- 网络不可用且插件未附带安装包 → 自己下载解压后填 `exe_path`
+- 所有下载源都连不上（离线/代理异常）→ 自己下载解压后填 `exe_path`
   （或放进插件会自动搜索的位置）。
 - 你在 BiliLearn 面板里改过默认密码 → 把新密码填到 `panel_password`。
 
-### 关于自带安装包
+### 关于自动下载与镜像源
 
-插件仓库的 `assets/` 目录随版本附带 BiliLearn 安装包（当前 3.1.6，约 102MB），
-供离线使用。GitHub 不允许单文件超过 100MB，因此它以**分卷**形式存放
-（`*.zip.part001…004` + `installer-manifest.json`）；插件首次运行时会自动拼回完整
-zip（带 SHA256 校验）并缓存，之后直接用缓存。
+插件不附带安装包，改为一律自动下载：本地找不到 BiliLearn 时，从
+[GitHub release](https://github.com/xiaoyaya191/bilibili_learning_bot/releases)
+拉取最新版，下载完成后校验 SHA256，再解包到插件数据目录。
 
-市场发布包同样包含这些分卷，因此从市场安装的插件也无需联网即可首次启动。
-BiliLearn 升级后，插件会在本地找不到时自动从 GitHub release 下载新版；
-`assets/` 里的分卷随插件版本更新即可——用仓库自带工具重新切：
+国内直连 GitHub 经常超时，因此内置了**多镜像源自动切换**，按顺序尝试，
+任一成功即止；单个源失败自动换下一个，全部失败才报错：
 
-```bash
-# 把新下载的安装包 zip 放进 bridge_plugin/assets/，然后：
-python tools/split_installer.py            # 默认切 32MiB 一卷并校验后删除原包
-python tools/split_installer.py --part-mb 64
-```
+| 顺序 | 源 | 说明 |
+|------|----|------|
+| 1 | `gh-proxy.com` | 国内镜像，实测最快 |
+| 2 | `ghfast.top` | 国内镜像 |
+| 3 | `official` | GitHub 官方直连（海外/无墙环境更快） |
+
+镜像清单在 `installer.py` 的 `_DOWNLOAD_SOURCES`，加一个源就是加一行
+`("名字", "https://域名/{}")`——`{}` 是原始 URL 的占位符。
+
+另外，网络请求（含元数据查询）采用「**先直连、失败再走系统代理**」策略：
+某些机器上 `HTTP_PROXY` 指向一个没在监听的端口，会让 urllib 直接放弃直连、
+所有请求报 `WinError 10061`；先试直连可正常穿越这种环境。
 
 ## 关于登录
 
