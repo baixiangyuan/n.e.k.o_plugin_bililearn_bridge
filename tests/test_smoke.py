@@ -316,5 +316,142 @@ class TestExeLookup(unittest.TestCase):
             self.assertEqual(Path(found).name, "BiliLearn Web.exe")
 
 
+class TestInstaller(unittest.TestCase):
+    """Bundled / cached installer discovery and safe extraction."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.installer = _load("bridge_installer_under_test", "installer.py")
+
+    def test_finds_bundled_installer(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin_dir = Path(tmp)
+            assets = plugin_dir / "assets"
+            assets.mkdir()
+            (assets / "BiliLearn-Web-3.1.6-Windows-x64.zip").write_bytes(b"stub")
+            found = self.installer.find_bundled_installer(plugin_dir)
+            self.assertIsNotNone(found)
+            self.assertEqual(found.name, "BiliLearn-Web-3.1.6-Windows-x64.zip")
+
+    def test_no_bundled_installer_returns_none(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(self.installer.find_bundled_installer(Path(tmp)))
+
+    def test_extracts_and_is_idempotent(self):
+        import tempfile
+        import zipfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin_dir = Path(tmp)
+            assets = plugin_dir / "assets"
+            assets.mkdir()
+            zip_path = assets / "BiliLearn-Web-3.1.6-Windows-x64.zip"
+            with zipfile.ZipFile(zip_path, "w") as archive:
+                archive.writestr("BiliLearn Web/BiliLearn Web.exe", "stub-exe")
+                archive.writestr("BiliLearn Web/_internal/keep.txt", "data")
+
+            state_dir = Path(tmp) / "state"
+            exe = self.installer.ensure_runtime_exe(zip_path, state_dir)
+            self.assertIsNotNone(exe)
+            self.assertEqual(Path(exe).name, "BiliLearn Web.exe")
+            self.assertTrue((state_dir / "runtime" / ".installed-version").is_file())
+            # Second call must reuse the extraction, not redo it.
+            again = self.installer.ensure_runtime_exe(zip_path, state_dir)
+            self.assertEqual(exe, again)
+            # And find_runtime_exe sees it without touching the zip.
+            self.assertEqual(Path(exe), self.installer.find_runtime_exe(state_dir))
+
+    def test_rejects_zip_slip_entries(self):
+        import tempfile
+        import zipfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            zip_path = Path(tmp) / "BiliLearn-Web-3.1.6-Windows-x64.zip"
+            with zipfile.ZipFile(zip_path, "w") as archive:
+                archive.writestr("../evil.txt", "escaped")
+            state_dir = Path(tmp) / "state"
+            exe = self.installer.ensure_runtime_exe(zip_path, state_dir)
+            self.assertIsNone(exe, "zip-slip entries must abort extraction")
+            self.assertFalse((Path(tmp) / "evil.txt").exists())
+
+    def test_cleanup_runtime(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / "state"
+            zip_path = state_dir.parent / "BiliLearn-Web-3.1.6-Windows-x64.zip"
+            import zipfile as _zip
+
+            with _zip.ZipFile(zip_path, "w") as archive:
+                archive.writestr("BiliLearn Web/BiliLearn Web.exe", "stub-exe")
+            self.assertIsNotNone(self.installer.ensure_runtime_exe(zip_path, state_dir))
+            self.assertTrue((state_dir / "runtime").is_dir())
+            self.installer.cleanup_runtime(state_dir)
+            self.assertFalse((state_dir / "runtime").exists())
+
+    def test_version_from_name(self):
+        self.assertEqual(
+            self.installer._version_from_name("BiliLearn-Web-3.1.6-Windows-x64.zip"),  # noqa: SLF001
+            "3.1.6",
+        )
+
+    def test_reassembles_split_parts_and_verifies(self):
+        import hashlib
+        import json
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin_dir = Path(tmp) / "plugin"
+            assets = plugin_dir / "assets"
+            assets.mkdir(parents=True)
+            name = "BiliLearn-Web-3.1.6-Windows-x64.zip"
+            payload = b"stub-zip-bytes" * 4096
+            (assets / name).write_bytes(payload)
+            # Split by hand into 3 uneven parts, mimicking tools/split_installer.py.
+            parts = [payload[:20000], payload[20000:50000], payload[50000:]]
+            names = []
+            for index, blob in enumerate(parts, start=1):
+                part_name = f"{name}.part{index:03d}"
+                (assets / part_name).write_bytes(blob)
+                names.append(part_name)
+            (assets / name).unlink()
+
+            (assets / "installer-manifest.json").write_text(json.dumps({
+                "name": name,
+                "size": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "part_bytes": 20000,
+                "parts": names,
+            }), encoding="utf-8")
+
+            state_dir = Path(tmp) / "state"
+            rebuilt = self.installer.reassemble_bundled(plugin_dir, state_dir)
+            self.assertIsNotNone(rebuilt)
+            self.assertEqual(rebuilt.name, name)
+            self.assertEqual(rebuilt.read_bytes(), payload)
+
+            # Second call must hit the cache, not re-read the parts.
+            cached = self.installer.reassemble_bundled(plugin_dir, state_dir)
+            self.assertEqual(rebuilt, cached)
+
+            # A tampered part must be rejected.
+            (assets / names[0]).write_bytes(b"corrupted")
+            other_state = Path(tmp) / "state2"
+            bad = self.installer.reassemble_bundled(plugin_dir, other_state)
+            self.assertIsNone(bad, "hash mismatch must abort reassembly")
+
+    def test_reassemble_without_manifest_returns_none(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin_dir = Path(tmp) / "plugin"
+            (plugin_dir / "assets").mkdir(parents=True)
+            self.assertIsNone(self.installer.reassemble_bundled(plugin_dir, Path(tmp) / "s"))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3,10 +3,20 @@
 让 N.E.K.O 猫娘**完整操控**独立的 [BiliLearn](https://github.com/xiaoyaya191/bilibili_learning_bot)
 （B站 AI 学习机器人）程序。
 
+**开箱即用**：装上插件就能用——不需要你下载安装包、不需要填 exe 路径。
+插件按下面的顺序自动搞定 BiliLearn：
+
+1. **本地已装** → 直接用（含之前自己解包的运行时）；
+2. **仓库自带安装包** → 解包到插件数据目录（随插件附带，离线可用）；
+3. **自动下载** → 从 GitHub release 拉最新版（带 SHA256 校验）后解包。
+
+之后以无头模式（`--serve`）拉起，**不弹面板、不建系统托盘**；
+已在运行则直接附接，绝不重复拉起。
+
 ## 它能做什么
 
-1. **拉起独立程序**：宿主启动 N.E.K.O 时，按配置以无头模式（`--serve`）拉起
-   `BiliLearn Web.exe`。启动**不弹出面板**、不建系统托盘；已在运行则直接附接，不重复拉起。
+1. **自动就位**：见上。本地没有 BiliLearn 时，插件自己取得并解包安装包，
+   全部落在插件数据目录里（`data/runtime/`），不写系统目录，清理即消失。
 2. **自动登录面板**：BiliLearn 3.1.6 的面板对 `/api/*` 有「确认免责声明 → 登录」两道门槛。
    插件会自动完成这个握手（默认使用 BiliLearn 首次启动预置的本地账号 `yaya`），
    并保持会话 Cookie，让每个调用都落在已登录态上。会话过期会自动重登一次。
@@ -52,7 +62,8 @@
 
 ```toml
 [bililearn_bridge]
-exe_path = ""            # BiliLearn Web.exe 路径；留空自动搜索
+exe_path = ""            # 一般留空：插件自动取得 BiliLearn（自带包/下载/本地）
+auto_install = true      # 本地没有时是否自动下载解包（false 则只找本地）
 port = 18083             # 面板端口（插件会优先读账户注册表里的真实端口）
 launch_mode = "serve"    # serve=无头服务器; silent=无头无托盘
 auto_launch = true       # N.E.K.O 启动时自动拉起
@@ -65,9 +76,28 @@ request_timeout = 20     # 单请求超时（秒）
 
 ## 前置
 
-1. 从 [BiliLearn Releases](https://github.com/xiaoyaya191/bilibili_learning_bot/releases)
-   下载 `BiliLearn-Web-<版本>-Windows-x64.zip`，解压得到 `BiliLearn Web/BiliLearn Web.exe`。
-2. 在插件配置里填 `exe_path`，或把它放在插件会自动搜索的位置。
+无。默认配置即可开箱即用。仅以下情况需要手动干预：
+
+- 网络不可用且插件未附带安装包 → 自己下载解压后填 `exe_path`
+  （或放进插件会自动搜索的位置）。
+- 你在 BiliLearn 面板里改过默认密码 → 把新密码填到 `panel_password`。
+
+### 关于自带安装包
+
+插件仓库的 `assets/` 目录随版本附带 BiliLearn 安装包（当前 3.1.6，约 102MB），
+供离线使用。GitHub 不允许单文件超过 100MB，因此它以**分卷**形式存放
+（`*.zip.part001…004` + `installer-manifest.json`）；插件首次运行时会自动拼回完整
+zip（带 SHA256 校验）并缓存，之后直接用缓存。
+
+市场发布包同样包含这些分卷，因此从市场安装的插件也无需联网即可首次启动。
+BiliLearn 升级后，插件会在本地找不到时自动从 GitHub release 下载新版；
+`assets/` 里的分卷随插件版本更新即可——用仓库自带工具重新切：
+
+```bash
+# 把新下载的安装包 zip 放进 bridge_plugin/assets/，然后：
+python tools/split_installer.py            # 默认切 32MiB 一卷并校验后删除原包
+python tools/split_installer.py --part-mb 64
+```
 
 ## 关于登录
 
@@ -82,8 +112,8 @@ BiliLearn 面板默认账号是 `yaya` / `yaya`（首次启动自动创建，**�
 
 ## 依赖
 
-无。仅使用 Python 标准库（`subprocess` / `urllib` / `http.cookiejar` / `asyncio`），
-可直接随 N.E.K.O 加载。
+无。仅使用 Python 标准库（`subprocess` / `urllib` / `http.cookiejar` / `zipfile` /
+`asyncio`），可直接随 N.E.K.O 加载。
 
 ## 开发
 

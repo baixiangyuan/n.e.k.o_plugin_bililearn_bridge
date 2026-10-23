@@ -9,3 +9,8 @@ dependencies = []
 
 [project.readme]
 file = "README.md"
+
+# assets/ 里随包附带 BiliLearn 安装包（约 100MB），刻意不做排除：
+# 市场包也带它，装完插件即可离线开箱即用，无需联网下载。
+# 已核对 N.E.K.O 打包门禁：单成员上限 256MiB、总上限 1GiB、压缩比 200:1，
+# 102MB 的 zip 均在限额内（见 neko/plugin/neko_plugin_cli/core/archive_utils.py）。

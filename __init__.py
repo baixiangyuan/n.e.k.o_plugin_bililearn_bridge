@@ -2,8 +2,10 @@
 
 设计目标（在 v1 的“拉起 exe + 三个接口”基础上做全功能嫁接）：
 
-* **拉得起**：宿主启动时按配置拉起 ``BiliLearn Web.exe --serve``（无头、不弹面板、
-  不建托盘）；已在运行则直接附接，绝不重复拉起。
+* **开箱即用**：用户不需要手填 exe 路径。插件按
+  「运行时已解包 → 仓库自带安装包 → 自动从 GitHub 下载 → 本地已装扫描」
+  的顺序取得 BiliLearn，并自动解包到插件数据目录后无头拉起
+  （不弹面板、不建托盘）；已在运行则直接附接，绝不重复拉起。
 * **连得上**：面板对 ``/api/*`` 有免责声明 + 登录两道门槛。本插件自动完成
   「确认免责声明 → 登录」握手（默认账号 ``yaya``，可在插件配置里改），
   并保持会话 Cookie，让后续每个调用都落在已登录态上。
@@ -12,7 +14,7 @@
   ``bililearn_api_call`` / ``api_batch`` 通用透传，配合
   ``api_groups`` / ``api_search`` / ``api_describe`` 做能力发现。
 
-零第三方依赖：仅标准库（subprocess / urllib / http.cookiejar / asyncio）。
+零第三方依赖：仅标准库（subprocess / urllib / http.cookiejar / zipfile / asyncio）。
 
 注意：N.E.K.O 的市场发布校验器（``neko-plugin check -r``）要求入口类
 **必须在本文件（插件包的 ``__init__.py``）中定义**，而非从子模块 re-export，
@@ -39,7 +41,7 @@ from plugin.sdk.plugin import (
     plugin_entry,
 )
 
-from . import catalog
+from . import catalog, installer
 from .client import BiliLearnClient
 from .director import BiliLearnDirector
 
@@ -83,6 +85,8 @@ class BiliLearnBridgePlugin(NekoPluginBase):
         self.auto_setup: bool = True
         self.request_timeout: float = 20.0
         self.search_dirs: tuple[str, ...] = ()
+        # 开箱即用开关：本地找不到 exe 时是否自动下载/解包（默认开）
+        self.auto_install: bool = True
         # 由本插件拉起的子进程句柄（仅当我们自己启动的才负责停止）
         self._proc: asyncio.subprocess.Process | None = None
         # 实际生效端口（可能从账户注册表读到的真实端口）
@@ -119,14 +123,16 @@ class BiliLearnBridgePlugin(NekoPluginBase):
         if isinstance(raw_dirs, str):
             raw_dirs = [raw_dirs]
         self.search_dirs = tuple(str(item).strip() for item in raw_dirs if str(item).strip())
+        self.auto_install = bool(bc.get("auto_install", True))
 
         self._effective_port = self._discover_port()
         self._reset_client()
 
-        exe = self._resolve_exe()
+        exe = await self._ensure_exe()
         if not exe:
             self.logger.warning(
-                "未找到 BiliLearn Web.exe，请在插件配置 exe_path 中指定；桥接功能处于待命状态。"
+                "未找到 BiliLearn 安装包/程序（自带包缺失、下载失败、本地未装）；"
+                "可在插件配置 exe_path 中手动指定。桥接功能处于待命状态。"
             )
             return Ok({"status": "no_exe", "auto_launch": self.auto_launch})
 
@@ -212,7 +218,18 @@ class BiliLearnBridgePlugin(NekoPluginBase):
         return self.port
 
     def _resolve_exe(self) -> str | None:
-        """按 配置路径 -> PATH -> 常见位置 -> 自定义 search_dirs 顺序定位 exe。"""
+        """按 运行时已解包 -> 配置路径 -> PATH -> 常见位置 -> 自定义 search_dirs 顺序定位 exe。
+
+        只做同步的本地查找；不含下载/解包（那些由 :meth:`_ensure_exe` 负责）。
+        """
+        # 0) 之前已解包到插件数据目录的运行时（开箱即用的落地结果）
+        try:
+            state_dir = self.data_path()
+        except Exception:  # noqa: BLE001 - storage 未就绪时跳过
+            state_dir = None
+        found = installer.find_runtime_exe(state_dir)
+        if found:
+            return str(found)
         if self.exe_path:
             candidate = Path(self.exe_path).expanduser()
             if not candidate.is_absolute():
@@ -236,6 +253,56 @@ class BiliLearnBridgePlugin(NekoPluginBase):
             if found:
                 return str(found)
         return None
+
+    async def _ensure_exe(self) -> str | None:
+        """保证有一个可用的 exe：本地没有就自动下载/解包（开箱即用）。
+
+        顺序：本地已解包/已装 -> 仓库自带安装包 -> 自动下载安装包。
+        下载与解包都放到线程里执行，避免阻塞事件循环。
+        """
+        exe = self._resolve_exe()
+        if exe:
+            return exe
+        if not self.auto_install:
+            return None
+        try:
+            state_dir = self.data_path()
+        except Exception:  # noqa: BLE001 - storage 未就绪时降级
+            state_dir = None
+        return await asyncio.to_thread(self._install_blocking, state_dir)
+
+    def _install_blocking(self, state_dir: Path | None) -> str | None:
+        """同步执行「取得安装包 -> 解包 -> 返回 exe」。在工作线程中调用。"""
+        # 1) 仓库自带的分卷安装包（GitHub 单文件 100MB 上限下的形态，离线可用）
+        bundled = installer.reassemble_bundled(self.plugin_dir, state_dir, logger=self.logger)
+        if bundled:
+            self.logger.info("使用仓库自带的 BiliLearn 安装包：%s", bundled.name)
+            exe = installer.ensure_runtime_exe(bundled, state_dir, logger=self.logger)
+            if exe:
+                return str(exe)
+        # 1b) 未分卷时的整包自带（小版本或本地调试形态）
+        whole = installer.find_bundled_installer(self.plugin_dir)
+        if whole:
+            self.logger.info("使用仓库自带的 BiliLearn 安装包：%s", whole.name)
+            exe = installer.ensure_runtime_exe(whole, state_dir, logger=self.logger)
+            if exe:
+                return str(exe)
+        # 2) 本地缓存（之前下载过）
+        cached = installer.find_cached_installer(state_dir)
+        if cached:
+            self.logger.info("使用已缓存的 BiliLearn 安装包：%s", cached.name)
+            exe = installer.ensure_runtime_exe(cached, state_dir, logger=self.logger)
+            if exe:
+                return str(exe)
+        # 3) 自动从 GitHub latest release 下载
+        self.logger.info("本地没有 BiliLearn，开始自动下载最新版 …")
+        downloaded, note = installer.download_installer(state_dir, timeout=max(60.0, self.request_timeout * 3))
+        if not downloaded:
+            self.logger.error("自动下载 BiliLearn 失败：%s", note)
+            return None
+        self.logger.info("%s", note)
+        exe = installer.ensure_runtime_exe(downloaded, state_dir, logger=self.logger)
+        return str(exe) if exe else None
 
     @staticmethod
     def _find_exe_under(root: Path, depth: int) -> Path | None:
@@ -425,9 +492,12 @@ class BiliLearnBridgePlugin(NekoPluginBase):
         timeout=60.0,
     )
     async def start(self, **_) -> Any:
-        exe = self._resolve_exe()
+        exe = await self._ensure_exe()
         if not exe:
-            return Err(SdkError("未找到 BiliLearn Web.exe，请在插件配置 exe_path 指定路径。"))
+            return Err(SdkError(
+                "未找到 BiliLearn（自带包缺失、自动下载失败且本地未安装）；"
+                "请在插件配置 exe_path 手动指定，或检查网络后重试。"
+            ))
         self._effective_port = self._discover_port()
         self._reset_client()
         if await self._is_healthy():

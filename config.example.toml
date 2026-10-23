@@ -6,8 +6,11 @@ auto_start = true
 
 # 插件自定义配置（运行时可通过 self.config.dump() 读取）
 [bililearn_bridge]
-# BiliLearn Web.exe 的绝对路径；留空则自动搜索（PATH、常见安装位置、search_dirs）
+# BiliLearn Web.exe 的绝对路径。留空即可：插件开箱即用——本地没装时自动用
+# 仓库自带安装包，或从 GitHub release 自动下载并解包到插件数据目录。
 exe_path = ""
+# 本地找不到 BiliLearn 时，是否自动下载/解包安装包（默认 true，即开箱即用）
+auto_install = true
 # Web 面板端口。留空/默认即可：插件会优先读 BiliLearn 账户注册表里的真实端口，
 # 仅在读取不到时才用这里的值（默认 18083）
 port = 18083

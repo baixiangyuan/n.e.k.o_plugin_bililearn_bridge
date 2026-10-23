@@ -4,6 +4,11 @@
 
 ## 新功能
 
+- **开箱即用**：不再需要手动填 exe 路径。插件按
+  「本地已装 → 仓库自带安装包 → 自动下载」的顺序取得 BiliLearn，
+  自动解包到插件数据目录后无头拉起。仓库 `assets/` 附带 3.1.6 安装包（离线可用），
+  因 GitHub 单文件 100MB 上限而以分卷形式存放（4 卷 + manifest），
+  插件首次运行自动拼回并校验；本地缺失时从 GitHub release 自动下载新版。
 - **自动登录面板**：BiliLearn 3.1.6 的面板对 `/api/*` 有「免责声明 → 登录」两道门槛，
   v1 的所有业务调用实际会被 401 挡下。v2 自动完成握手并保持会话 Cookie，
   会话失效时自动重登一次；凭据按 `配置 > 插件保存 > 预置默认` 顺序尝试，
@@ -16,8 +21,8 @@
 - **端口自动对齐**：打包版 BiliLearn 会把端口写进账户注册表（`accounts.json`），
   v1 写死的端口会与真实端口错位。v2 启动后读取注册表，始终连到真实端口。
 - **附接优先**：已在运行的实例直接附接；只有自己拉起的进程才负责停止。
-- **exe 自动发现**：支持配置路径、PATH、常见安装位置、自定义 `search_dirs`
-  及插件目录旁的浅层扫描。
+- **exe 定位**：除上述自动安装链路外，仍支持配置路径、PATH、常见安装位置、
+  自定义 `search_dirs` 及插件目录旁的浅层扫描。
 
 ## 入口数量
 
@@ -25,7 +30,17 @@
 
 ## 兼容性
 
-- 纯标准库实现（`subprocess` / `urllib` / `http.cookiejar` / `asyncio`），零第三方依赖。
+- 纯标准库实现（`subprocess` / `urllib` / `http.cookiejar` / `zipfile` / `asyncio`），
+  零第三方依赖。
 - 针对 BiliLearn **3.1.6** 生成接口目录；BiliLearn 升级后可用 `tools/` 下脚本重新生成。
 - v1 的入口 id（`start` / `stop` / `restart` / `status` / `open_panel` / `bot_start` /
   `bot_stop` / `bot_status`）全部保留，原有调用方无需改动。
+
+## 已验证
+
+- 官方校验器 `neko-plugin check -r`（含自带安装包分卷）：**通过**。
+- Ruff（市场门禁同款规则）：All checks passed。
+- 插件测试套件：**27 项通过**（含安装包发现、分卷重组与篡改拒绝、
+  解包幂等、zip-slip 防御、缓存清理）。
+- 真实 exe 端到端：分卷重组 → 解包 → `--serve` 拉起 → **3.3s 就绪** →
+  自动登录 → `/api/info` 返回 version=3.1.6。

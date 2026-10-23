@@ -9,7 +9,7 @@ version = "2.0.0"
 entry = "plugin.plugins.bililearn_bridge:BiliLearnBridgePlugin"
 
 [plugin.author]
-name = "WorkBuddy"
+name = "bxy"
 
 [plugin.sdk]
 recommended = ">=0.1.0,<0.2.0"
