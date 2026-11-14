@@ -29,6 +29,32 @@ from plugin.sdk.plugin import Err, Ok, PluginRouter, SdkError, plugin_entry
 _BOT_MODES = ("smart", "current")
 _LOG_SOURCES = ("all", "bot", "monitor", "reviews")
 
+# 危险写接口：会改密码、改账号、改全局配置或代理。能力保留（猫娘仍能调用），
+# 但要求显式 confirm=true，避免一句含糊的自然语言就静默改了凭据或网络设置。
+_DANGEROUS_WRITE_PREFIXES = (
+    "/api/auth/setup",
+    "/api/auth/reset-password",
+    "/api/auth/reset-password-email",
+    "/api/auth/recovery-question",
+    "/api/auth/security-question",
+    "/api/account/update-credentials",
+    "/api/account/email",
+    "/api/config",
+    "/api/network/proxy",
+)
+_WRITE_METHODS = ("POST", "PUT", "PATCH", "DELETE")
+
+
+def _needs_confirmation(method: str, path: str) -> bool:
+    """该调用是否会修改敏感设置（需要显式确认）。"""
+    if method.upper() not in _WRITE_METHODS:
+        return False
+    normalized = path.split("?", 1)[0].rstrip("/") or "/"
+    return any(
+        normalized == prefix or normalized.startswith(prefix + "/")
+        for prefix in _DANGEROUS_WRITE_PREFIXES
+    )
+
 
 class BiliLearnDirector(PluginRouter):
     """Named entries covering BiliLearn's everyday operations."""
@@ -61,6 +87,7 @@ class BiliLearnDirector(PluginRouter):
             "直接调用 BiliLearn 面板的任意 HTTP 接口（共 308 个），这是控制全部功能的主入口。"
             "path 形如 /api/bot/start；GET 用 query 传参，写操作用 body 传 JSON 对象。"
             "不知道有哪些接口时，先用 api_groups 看分组、api_search 搜关键词、api_describe 看某组详情。"
+            "涉及改密码/改账号/改全局配置/改代理的写接口，需要额外传 confirm=true。"
         ),
         input_schema={
             "type": "object",
@@ -69,17 +96,36 @@ class BiliLearnDirector(PluginRouter):
                 "method": {"type": "string", "description": "HTTP 方法，默认 GET", "default": "GET"},
                 "body": {"type": "object", "description": "JSON 请求体（写操作使用）"},
                 "query": {"type": "object", "description": "URL 查询参数（GET 使用）"},
+                "confirm": {
+                    "type": "boolean",
+                    "description": "危险写接口（改密码/账号/全局配置/代理）必须显式设为 true",
+                    "default": False,
+                },
             },
             "required": ["path"],
         },
         timeout=300.0,
     )
-    async def api_call(self, path: str = "", method: str = "GET", body: Any = None, query: Any = None):
+    async def api_call(
+        self,
+        path: str = "",
+        method: str = "GET",
+        body: Any = None,
+        query: Any = None,
+        confirm: bool = False,
+    ):
         if not path.strip():
             return Err(SdkError("path 不能为空，例如 /api/info。"))
+        clean_path = path.strip()
+        method_upper = method.upper()
+        if _needs_confirmation(method_upper, clean_path) and not confirm:
+            return Err(SdkError(
+                f"{method_upper} {clean_path} 会修改敏感设置（密码/账号/全局配置/代理），"
+                "如确认要执行，请传 confirm=true。"
+            ))
         body_dict = body if isinstance(body, dict) else None
         query_dict = query if isinstance(query, dict) else None
-        return await self._do(method.upper(), path.strip(), body_dict, f"调用 {method.upper()} {path}", query=query_dict)
+        return await self._do(method_upper, clean_path, body_dict, f"调用 {method_upper} {clean_path}", query=query_dict)
 
     @plugin_entry(
         id="api_batch",
@@ -101,6 +147,7 @@ class BiliLearnDirector(PluginRouter):
                             "method": {"type": "string", "default": "GET"},
                             "body": {"type": "object"},
                             "query": {"type": "object"},
+                            "confirm": {"type": "boolean", "default": False},
                         },
                         "required": ["path"],
                     },
@@ -121,9 +168,19 @@ class BiliLearnDirector(PluginRouter):
             if not isinstance(item, dict) or not str(item.get("path") or "").strip():
                 results.append({"index": index, "ok": False, "error": "缺少 path"})
                 continue
+            method_upper = str(item.get("method") or "GET").upper()
+            clean_path = str(item["path"]).strip()
+            if _needs_confirmation(method_upper, clean_path) and not item.get("confirm"):
+                results.append({
+                    "index": index,
+                    "path": clean_path,
+                    "ok": False,
+                    "error": "该接口会修改敏感设置，需在调用项里加 confirm: true",
+                })
+                continue
             res = await plugin._api_call(
-                str(item.get("method") or "GET").upper(),
-                str(item["path"]).strip(),
+                method_upper,
+                clean_path,
                 body=item.get("body") if isinstance(item.get("body"), dict) else None,
                 query=item.get("query") if isinstance(item.get("query"), dict) else None,
             )

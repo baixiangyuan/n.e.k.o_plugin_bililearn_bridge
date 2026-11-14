@@ -505,6 +505,40 @@ class TestInstaller(unittest.TestCase):
             # No half-finished .part may survive a failed source.
             self.assertFalse(target.with_suffix(".bin.part").exists())
 
+    def test_installer_url_is_pinned_and_deterministic(self):
+        url = self.installer.installer_download_url()  # noqa: SLF001
+        self.assertIn("/releases/download/v3.1.6/", url)
+        self.assertTrue(url.endswith("/BiliLearn-Web-3.1.6-Windows-x64.zip"))
+        # No API call is involved: the URL is built purely from constants.
+        self.assertNotIn("api.github.com", url)
+
+    def test_checksum_rejects_unknown_version(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            blob = Path(tmp) / "x.zip"
+            blob.write_bytes(b"whatever")
+            ok, note = self.installer._verify_checksum(blob, "9.9.9")  # noqa: SLF001
+            self.assertFalse(ok, "unknown versions must fail closed")
+            self.assertIn("没有内置的可信 SHA256", note)
+
+    def test_checksum_rejects_tampered_file(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            blob = Path(tmp) / "x.zip"
+            blob.write_bytes(b"not the official installer")
+            ok, note = self.installer._verify_checksum(blob, "3.1.6")  # noqa: SLF001
+            self.assertFalse(ok)
+            self.assertIn("校验未通过", note)
+
+    def test_download_refuses_version_without_hash(self):
+        result, note = self.installer.download_installer(  # noqa: SLF001
+            None, version="9.9.9"
+        )
+        self.assertIsNone(result)
+        self.assertIn("拒绝下载", note)
+
     def test_download_gives_up_after_all_sources(self):
         import tempfile
 
@@ -529,6 +563,108 @@ class TestInstaller(unittest.TestCase):
             self.assertFalse(ok)
             for name, _ in self.installer._DOWNLOAD_SOURCES:  # noqa: SLF001
                 self.assertIn(name, note)
+
+
+class TestDangerousEndpointGuard(unittest.TestCase):
+    """api_call must require explicit confirmation for credential/config writes.
+
+    Loads director.py behind a minimal SDK stub, so this runs in CI without the
+    real N.E.K.O package — closing one of the review's test blind spots.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import types
+
+        plugin_pkg = types.ModuleType("plugin")
+        plugin_pkg.__path__ = []
+        sdk_pkg = types.ModuleType("plugin.sdk")
+        sdk_pkg.__path__ = []
+        core = types.ModuleType("plugin.sdk.plugin")
+
+        class PluginRouter:
+            def __init__(self, *args, **kwargs):
+                self.main_plugin = None
+
+        class SdkError(Exception):
+            pass
+
+        class Ok:
+            def __init__(self, payload):
+                self.payload = payload
+
+        class Err:
+            def __init__(self, error):
+                self.error = error
+
+        def plugin_entry(**kwargs):
+            def decorate(fn):
+                return fn
+
+            return decorate
+
+        core.PluginRouter = PluginRouter
+        core.SdkError = SdkError
+        core.Ok = Ok
+        core.Err = Err
+        core.plugin_entry = plugin_entry
+        sys.modules.setdefault("plugin", plugin_pkg)
+        sys.modules.setdefault("plugin.sdk", sdk_pkg)
+        sys.modules["plugin.sdk.plugin"] = core
+        cls.mod = _load("bridge_director_under_test", "director.py")
+
+    def _director(self):
+        class FakePlugin:
+            def __init__(self):
+                self.calls = []
+
+            async def _api_call(self, method, path, **kwargs):
+                self.calls.append((method, path, kwargs))
+                return {"ok": True, "status": 200, "data": {"ok": True}}
+
+            def _shape(self, res, action):
+                return ("shaped", action)
+
+        director = self.mod.BiliLearnDirector()
+        fake = FakePlugin()
+        director.main_plugin = fake
+        return director, fake
+
+    def test_dangerous_write_needs_confirmation(self):
+        import asyncio
+
+        director, fake = self._director()
+        res = asyncio.run(director.api_call(path="/api/auth/setup", method="POST"))
+        self.assertIsInstance(res, self.mod.Err)
+        self.assertEqual(fake.calls, [], "unconfirmed dangerous call must not reach the panel")
+
+    def test_dangerous_write_with_confirmation_reaches_panel(self):
+        import asyncio
+
+        director, fake = self._director()
+        res = asyncio.run(director.api_call(path="/api/auth/setup", method="POST", confirm=True))
+        self.assertEqual(res[0], "shaped")
+        self.assertEqual(len(fake.calls), 1)
+
+    def test_reads_and_safe_writes_need_no_confirmation(self):
+        import asyncio
+
+        director, fake = self._director()
+        asyncio.run(director.api_call(path="/api/info", method="GET"))
+        asyncio.run(director.api_call(path="/api/bot/start", method="POST"))
+        self.assertEqual(len(fake.calls), 2)
+
+    def test_batch_skips_unconfirmed_dangerous_call(self):
+        import asyncio
+
+        director, fake = self._director()
+        res = asyncio.run(director.api_batch(calls=[
+            {"path": "/api/info", "method": "GET"},
+            {"path": "/api/config", "method": "POST", "body": {}},
+        ]))
+        self.assertEqual(len(fake.calls), 1)
+        self.assertEqual(res.payload["succeeded"], 1)
+        self.assertFalse(res.payload["results"][1]["ok"])
 
 
 if __name__ == "__main__":

@@ -7,7 +7,8 @@
 插件按下面的顺序自动搞定 BiliLearn：
 
 1. **本地已装** → 直接用（含之前自己解包的运行时）；
-2. **自动下载** → 从 GitHub release 拉最新版（**多镜像源自动切换**，带 SHA256 校验）后解包。
+2. **自动下载** → 从 GitHub release 拉取**固定版本**（**多镜像源自动切换**，
+   并与代码内写死的官方 SHA256 比对）后解包。
 
 之后以无头模式（`--serve`）拉起，**不弹面板、不建系统托盘**；
 已在运行则直接附接，绝不重复拉起。
@@ -81,14 +82,24 @@ request_timeout = 20     # 单请求超时（秒）
   （或放进插件会自动搜索的位置）。
 - 你在 BiliLearn 面板里改过默认密码 → 把新密码填到 `panel_password`。
 
-### 关于自动下载与镜像源
+### 关于自动下载、版本固定与校验
 
-插件不附带安装包，改为一律自动下载：本地找不到 BiliLearn 时，从
-[GitHub release](https://github.com/xiaoyaya191/bilibili_learning_bot/releases)
-拉取最新版，下载完成后校验 SHA256，再解包到插件数据目录。
+插件不附带安装包，改为一律自动下载。为了不让「镜像被篡改」绕过校验，这里
+刻意做了三件事：
 
-国内直连 GitHub 经常超时，因此内置了**多镜像源自动切换**，按顺序尝试，
-任一成功即止；单个源失败自动换下一个，全部失败才报错：
+1. **版本固定**：下载 `PINNED_VERSION`（当前 3.1.6）的安装包，而不是
+   “latest”。版本与 `catalog.py` 内嵌的接口快照严格对应，避免新版 API 变化
+   导致入口失效。
+2. **URL 不由网络元数据决定**：直接按常量拼
+   `https://github.com/<owner>/<repo>/releases/download/v<版本>/<资产名>`，
+   不调用 GitHub API 取资产地址——否则元数据和安装包可以一起被镜像伪造。
+3. **校验和写死在代码里**：`KNOWN_INSTALLER_SHA256` 记录每个已知版本的
+   官方 SHA256（来自 GitHub Release 资产的 `digest` 字段，与同 release 的
+   `SHA256SUMS.txt` 一致）。**哈希不符或版本未知一律拒绝**，不存在
+   “没有校验和就跳过”的路径；缓存文件复用前也会重新校验。
+
+国内直连 GitHub 经常超时，因此下载阶段内置**多镜像源自动切换**，
+按顺序尝试，任一成功即止；单个源失败自动换下一个，全部失败才报错：
 
 | 顺序 | 源 | 说明 |
 |------|----|------|
@@ -99,9 +110,14 @@ request_timeout = 20     # 单请求超时（秒）
 镜像清单在 `installer.py` 的 `_DOWNLOAD_SOURCES`，加一个源就是加一行
 `("名字", "https://域名/{}")`——`{}` 是原始 URL 的占位符。
 
-另外，网络请求（含元数据查询）采用「**先直连、失败再走系统代理**」策略：
-某些机器上 `HTTP_PROXY` 指向一个没在监听的端口，会让 urllib 直接放弃直连、
-所有请求报 `WinError 10061`；先试直连可正常穿越这种环境。
+网络策略是「**先探测系统代理是否真能转发，可用则走代理，否则直连**」：
+只测 TCP 连通不够（某些代理端口能 accept 但转发仍报 `WinError 10061`），
+所以会真实发一次轻量请求判定；这样既不会在死代理上白等 SSL 超时，
+也能在内网必须走代理的环境里正常工作。
+
+升级 BiliLearn 时：重新生成 `catalog.py`，同时把新版本的哈希加进
+`KNOWN_INSTALLER_SHA256` / `KNOWN_INSTALLER_SIZE`，并把 `PINNED_VERSION`
+改成新版本——三者必须一起改。
 
 ## 关于登录
 
@@ -114,6 +130,11 @@ BiliLearn 面板默认账号是 `yaya` / `yaya`（首次启动自动创建，**�
 
 面板尚未创建账号时（`auto_setup = true`），插件会自动创建一个账号并把凭据存进插件数据目录。
 
+> **已知限制**：`data/panel_credentials.json` 以明文保存密码，文件权限在
+> Windows 上无法用 `chmod 0600` 真正收紧。请确保插件数据目录本身位于你信任的
+> 账户下；如果面板密码较敏感，优先用配置项 `panel_password` 或者改掉默认的
+> `yaya/yaya`，不要长期沿用默认口令。
+
 ## 依赖
 
 无。仅使用 Python 标准库（`subprocess` / `urllib` / `http.cookiejar` / `zipfile` /
@@ -125,8 +146,8 @@ BiliLearn 面板默认账号是 `yaya` / `yaya`（首次启动自动创建，**�
 # 运行测试（离线，无需 N.E.K.O SDK 也能跑）
 python -m unittest tests.test_smoke -v
 
-# 重新生成接口目录（BiliLearn 升级后）
-python tools/extract_api_catalog.py bilibili_learning_bot/web_panel.py tools/api_catalog.json
-python tools/extract_api_params.py  bilibili_learning_bot/web_panel.py tools/api_params.json
-python tools/gen_catalog_module.py  tools/api_catalog.json tools/api_params.json bridge_plugin/catalog.py
+# 重新生成接口目录（BiliLearn 升级后；在插件仓库根目录执行）
+python tools/extract_api_catalog.py ../bilibili_learning_bot/web_panel.py /tmp/api_catalog.json
+python tools/extract_api_params.py  ../bilibili_learning_bot/web_panel.py /tmp/api_params.json
+python tools/gen_catalog_module.py  /tmp/api_catalog.json /tmp/api_params.json catalog.py
 ```

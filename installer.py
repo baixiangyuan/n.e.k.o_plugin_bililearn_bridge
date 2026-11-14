@@ -1,14 +1,24 @@
-"""BiliLearn 安装包的获取与解包（仓库自带 + 自动下载）。
+"""BiliLearn 安装包的获取与解包（固定版本 + 多镜像源下载）。
 
 「开箱即用」由本模块保证：猫娘要操控 BiliLearn，但用户不该被要求
 手填 exe 路径。取得 exe 的顺序是
 
-1. **仓库自带**：插件包内的 ``assets/`` 目录随版本附带一份安装包，
-   离线可用、无需联网。
-2. **本地缓存**：之前自动下载过的包缓存在插件数据目录，不重复下载。
-3. **自动下载**：以上都没有时，从 GitHub release 拉取最新版
-   （``xiaoyaya191/bilibili_learning_bot``），带 SHA256 校验。
-4. **本地已装**：以上都失败则回退到常见安装位置扫描（见 ``__init__``）。
+1. **本地缓存**：之前下载/校验通过的包缓存在插件数据目录，不重复下载。
+2. **自动下载**：按 ``PINNED_VERSION`` 精确构造 release 资产 URL，
+   依次尝试多个镜像源（``gh-proxy.com`` → ``ghfast.top`` → 官方），
+   下载后与**代码内写死的** ``KNOWN_INSTALLER_SHA256`` 比对。
+3. **本地已装**：以上都失败则回退到常见安装位置扫描（见 ``__init__``）。
+
+安全说明（针对代码审查意见）：
+
+* 不再调用 GitHub API 获取「latest release」元数据——元数据与安装包若都来自
+  同一个第三方镜像，镜像被篡改时校验形同虚设。
+* 版本固定为 ``PINNED_VERSION``（与内嵌的 3.1.6 接口目录匹配），URL 由常量直接
+  拼接，不依赖任何网络提供的元数据。
+* 校验和写死在代码里，来自 GitHub Release 资产自身的 ``digest`` 字段与
+  ``BiliLearn-3.1.6-SHA256SUMS.txt``（两者一致）。**校验不通过或版本未知时
+  一律拒绝**，绝不「没有校验和就跳过」。
+* 缓存文件在复用前会重新计算哈希，半成品/被替换的缓存不会被当作可用。
 
 解包目标默认为插件数据目录下的 ``runtime/``（即 ``data_path()/runtime``），
 绝不写系统目录，卸载/清理时随插件数据一起消失。
@@ -34,12 +44,27 @@ GITHUB_REPO = "bilibili_learning_bot"
 # 安装包名前缀（版本号在后）：BiliLearn-Web-3.1.6-Windows-x64.zip
 INSTALLER_PREFIX = "BiliLearn-Web-"
 INSTALLER_SUFFIX = "-Windows-x64.zip"
-# 仓库自带安装包所在目录（相对插件包根）。
+# 可选的本地自带安装包目录（相对插件包根）。默认不存在；留给想离线
+# 自带一份 zip 的用户，不参与市场包（见 README）。
 ASSETS_DIRNAME = "assets"
 # 解包后的运行时根目录名（位于插件数据目录下）。
 RUNTIME_DIRNAME = "runtime"
-# 仓库自带的版本号（与 assets/ 下实际文件名保持一致）。
-BUNDLED_VERSION = "3.1.6"
+# 固定下载的 BiliLearn 版本：必须与 catalog.py 内嵌的接口目录版本一致。
+PINNED_VERSION = "3.1.6"
+# 兼容旧名（v2.0.x 的调用方/文档可能仍引用）。
+BUNDLED_VERSION = PINNED_VERSION
+
+# 已知版本的安装包 SHA256 —— 来自 GitHub Release 资产的 digest 字段
+# （与同 release 的 BiliLearn-<ver>-SHA256SUMS.txt 一致）。
+# 命中此表时**强制**校验；不在表内的版本一律拒绝下载（fail closed），
+# 避免「没有校验和就跳过」导致任意镜像内容被当作官方安装包执行。
+KNOWN_INSTALLER_SHA256: dict[str, str] = {
+    "3.1.6": "848a521aaa9420c4c85cbbeb749565b6f36163883cce587b68a3b814665fd9cf",
+}
+# 已知版本的安装包字节数（与 release 资产一致），用于下载前的快速校验。
+KNOWN_INSTALLER_SIZE: dict[str, int] = {
+    "3.1.6": 107280451,
+}
 
 # 多镜像源：GitHub release 直连在国内经常超时/极慢，故按「快镜像 → 官方」顺序尝试，
 # 逐个失败自动切换下一个，全部失败才报错。每个模板用 {} 占位原始 URL。
@@ -58,7 +83,6 @@ _SOURCE_RETRIES = 2
 # 代理可用性探测用的轻量 URL（命中 CDN，体积小、稳定）。
 _PROBE_URL = "https://api.github.com/zen"
 
-_RELEASE_API = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
 _USER_AGENT = "n.e.k.o-plugin-bililearn-bridge"
 # 单块大小：1024 KiB，够快且内存占用可控。
 _CHUNK = 1024 * 1024
@@ -231,8 +255,26 @@ def _cache_dir(state_dir: Path | None) -> Path:
     return base / "installer-cache"
 
 
-def _asset_api_url() -> str:
-    return f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
+def installer_asset_name(version: str = PINNED_VERSION) -> str:
+    """固定版本的安装包文件名。"""
+    return f"{INSTALLER_PREFIX}{version}{INSTALLER_SUFFIX}"
+
+
+def installer_download_url(version: str = PINNED_VERSION) -> str:
+    """固定版本的官方下载 URL（不含镜像前缀）。
+
+    直接用常量拼接，不经过 GitHub API：元数据若来自第三方镜像，镜像被篡改时
+    校验就失去意义。版本固定也保证与 catalog.py 的接口快照一致。
+    """
+    return (
+        f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/download/"
+        f"v{version}/{installer_asset_name(version)}"
+    )
+
+
+def expected_sha256(version: str) -> str | None:
+    """版本对应的官方 SHA256；未知版本返回 None（调用方应拒绝下载）。"""
+    return KNOWN_INSTALLER_SHA256.get(version)
 
 
 def _system_proxy_usable(timeout: float = 4.0) -> bool:
@@ -271,60 +313,6 @@ def _http_get(url: str, timeout: float = 30.0) -> bytes:
     direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     with direct.open(request, timeout=timeout) as response:  # noqa: S310 - 固定域名
         return response.read()
-
-
-def _release_metadata(timeout: float) -> dict[str, Any]:
-    """读取 latest release 元数据（同样走多镜像源，api.github.com 国内常被挡）。
-
-    失败时抛出 OSError 由上层降级处理。
-    """
-    url = _asset_api_url()
-    last_error: Exception | None = None
-    for source_name, candidate in _mirror_urls(url):
-        try:
-            raw = _http_get(candidate, timeout=timeout)
-        except (OSError, urllib.error.URLError) as exc:
-            last_error = exc
-            continue
-        try:
-            data = json.loads(raw.decode("utf-8"))
-        except ValueError as exc:
-            last_error = exc
-            continue
-        if isinstance(data, dict):
-            return data
-        last_error = OSError("unexpected release metadata")
-    raise OSError(f"无法读取 release 信息（已尝试全部源）：{last_error}")
-
-
-def _pick_installer_asset(metadata: dict[str, Any]) -> tuple[str, str, int] | None:
-    """从 release 资产里挑 Windows x64 安装包，返回 (url, name, size)。"""
-    assets = metadata.get("assets")
-    if not isinstance(assets, list):
-        return None
-    for asset in assets:
-        if not isinstance(asset, dict):
-            continue
-        name = str(asset.get("name") or "")
-        url = str(asset.get("browser_download_url") or "")
-        size = int(asset.get("size") or 0)
-        if name.startswith(INSTALLER_PREFIX) and name.endswith(INSTALLER_SUFFIX) and url:
-            return url, name, size
-    return None
-
-
-def _pick_checksum_asset(metadata: dict[str, Any]) -> str | None:
-    assets = metadata.get("assets")
-    if not isinstance(assets, list):
-        return None
-    for asset in assets:
-        if not isinstance(asset, dict):
-            continue
-        name = str(asset.get("name") or "")
-        url = str(asset.get("browser_download_url") or "")
-        if name.endswith("SHA256SUMS.txt") and url:
-            return url
-    return None
 
 
 def _mirror_urls(url: str) -> list[tuple[str, str]]:
@@ -406,26 +394,18 @@ def _download_via_mirrors(
     return False, "；".join(attempts)
 
 
-def _verify_against_sums(target: Path, sums_url: str, timeout: float) -> bool:
-    """有 SHA256SUMS.txt 就校验；没有则跳过（返回 True）。"""
-    text = ""
-    for source_name, candidate in _mirror_urls(sums_url):
-        try:
-            text = _http_get(candidate, timeout=timeout).decode("utf-8", "replace")
-            break
-        except (OSError, urllib.error.URLError):
-            continue
-    if not text:
-        return True
-    expected = ""
-    for line in text.splitlines():
-        parts = line.split()
-        if len(parts) == 2 and parts[1].lstrip("*") == target.name:
-            expected = parts[0].lower()
-            break
+def _verify_checksum(target: Path, version: str) -> tuple[bool, str]:
+    """按代码内写死的官方哈希校验文件。
+
+    未知版本一律失败（fail closed）：没有可信哈希就绝不执行下载来的 exe。
+    """
+    expected = expected_sha256(version)
     if not expected:
-        return True
-    return _sha256_of(target).lower() == expected
+        return False, f"版本 {version} 没有内置的可信 SHA256，拒绝使用（请更新插件）"
+    actual = _sha256_of(target).lower()
+    if actual != expected:
+        return False, f"SHA256 校验未通过（期望 {expected[:12]}…，实际 {actual[:12]}…），已丢弃"
+    return True, "SHA256 校验通过"
 
 
 def download_installer(
@@ -434,28 +414,34 @@ def download_installer(
     *,
     logger: Any = None,
     on_source: Any = None,
+    version: str = PINNED_VERSION,
 ) -> tuple[Path | None, str]:
-    """从 GitHub latest release 下载安装包（多镜像源自动切换）。
+    """下载固定版本的安装包（多镜像源自动切换 + 写死哈希校验）。
 
-    返回 ``(路径, 说明)``；失败时路径为 ``None``，说明里带上每个源的失败原因，
-    由调用方降级到「本地扫描」并如实告知用户。
+    返回 ``(路径, 说明)``；失败时路径为 ``None``，说明里带上原因，
+    由调用方降级到「本地安装扫描」并如实告知用户。
     """
+    if not expected_sha256(version):
+        return None, f"版本 {version} 没有内置的可信 SHA256，拒绝下载（请更新插件）"
+
     cache = _cache_dir(state_dir)
-    try:
-        metadata = _release_metadata(timeout=timeout)
-    except (OSError, ValueError, urllib.error.URLError) as exc:
-        return None, f"读取 release 信息失败：{exc}"
-    picked = _pick_installer_asset(metadata)
-    if not picked:
-        return None, "latest release 中没有找到 Windows x64 安装包"
-    url, name, size = picked
+    name = installer_asset_name(version)
     target = cache / name
+    expected_size = KNOWN_INSTALLER_SIZE.get(version)
+
+    # 缓存复用也必须过哈希：避免半成品或被人替换过的缓存被当成官方包。
     try:
-        if target.is_file() and target.stat().st_size == size:
-            return target, f"复用缓存：{name}"
+        if target.is_file() and (not expected_size or target.stat().st_size == expected_size):
+            ok, note = _verify_checksum(target, version)
+            if ok:
+                return target, f"复用缓存：{name}（{note}）"
+            if logger:
+                logger.warning("缓存校验失败，重新下载：%s", note)
+            target.unlink(missing_ok=True)
     except OSError:
         pass
 
+    url = installer_download_url(version)
     effective = max(timeout, _SOURCE_TIMEOUT)
     ok, note = _download_via_mirrors(
         url, target, effective, logger=logger, on_source=on_source
@@ -463,20 +449,20 @@ def download_installer(
     if not ok:
         target.unlink(missing_ok=True)
         return None, f"所有下载源均失败（{note}）"
+
     try:
-        if size and target.stat().st_size != size:
+        if expected_size and target.stat().st_size != expected_size:
             target.unlink(missing_ok=True)
-            return None, "下载文件大小与 release 不符，已丢弃"
+            return None, f"下载文件大小不符（期望 {expected_size}），已丢弃"
     except OSError as exc:
         target.unlink(missing_ok=True)
-        return None, f"下载后校验失败：{exc}"
+        return None, f"下载后读取失败：{exc}"
 
-    sums_url = _pick_checksum_asset(metadata)
-    if sums_url and not _verify_against_sums(target, sums_url, timeout=timeout):
+    ok, checksum_note = _verify_checksum(target, version)
+    if not ok:
         target.unlink(missing_ok=True)
-        return None, "SHA256 校验未通过，已丢弃"
-    version = _version_from_name(name)
-    return target, f"已下载 {name}（{version}，来源 {note}）"
+        return None, checksum_note
+    return target, f"已下载 {name}（{version}，来源 {note}，{checksum_note}）"
 
 
 def _find_exe_in(tree: Path, max_depth: int = 4) -> Path | None:

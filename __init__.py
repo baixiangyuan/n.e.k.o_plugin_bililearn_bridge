@@ -3,9 +3,9 @@
 设计目标（在 v1 的“拉起 exe + 三个接口”基础上做全功能嫁接）：
 
 * **开箱即用**：用户不需要手填 exe 路径。插件按
-  「运行时已解包 → 仓库自带安装包 → 自动从 GitHub 下载 → 本地已装扫描」
-  的顺序取得 BiliLearn，并自动解包到插件数据目录后无头拉起
-  （不弹面板、不建托盘）；已在运行则直接附接，绝不重复拉起。
+  「本地缓存 → 多镜像源下载固定版本 → 本地已装扫描」
+  的顺序取得 BiliLearn，下载后与内置信任哈希比对，再解包到插件数据目录
+  并无头拉起（不弹面板、不建托盘）；已在运行则直接附接，绝不重复拉起。
 * **连得上**：面板对 ``/api/*`` 有免责声明 + 登录两道门槛。本插件自动完成
   「确认免责声明 → 登录」握手（默认账号 ``yaya``，可在插件配置里改），
   并保持会话 Cookie，让后续每个调用都落在已登录态上。
@@ -131,8 +131,8 @@ class BiliLearnBridgePlugin(NekoPluginBase):
         exe = await self._ensure_exe()
         if not exe:
             self.logger.warning(
-                "未找到 BiliLearn 安装包/程序（自带包缺失、下载失败、本地未装）；"
-                "可在插件配置 exe_path 中手动指定。桥接功能处于待命状态。"
+                "未找到 BiliLearn 安装包/程序（下载失败且本地未安装）；"
+                "可在插件配置 exe_path 中手动指定，或检查网络后重试。桥接功能处于待命状态。"
             )
             return Ok({"status": "no_exe", "auto_launch": self.auto_launch})
 
@@ -257,7 +257,7 @@ class BiliLearnBridgePlugin(NekoPluginBase):
     async def _ensure_exe(self) -> str | None:
         """保证有一个可用的 exe：本地没有就自动下载/解包（开箱即用）。
 
-        顺序：本地已解包/已装 -> 仓库自带安装包 -> 自动下载安装包。
+        顺序：本地已解包/已装 -> 自动下载固定版本 -> 可选离线兜底包。
         下载与解包都放到线程里执行，避免阻塞事件循环。
         """
         exe = self._resolve_exe()
@@ -294,12 +294,12 @@ class BiliLearnBridgePlugin(NekoPluginBase):
                 return str(exe)
         else:
             self.logger.error("自动下载 BiliLearn 失败：%s", note)
-        # 3) 仓库自带的安装包（若附带：分卷或整包）
+        # 3) 可选的离线兜底：用户自行放进 assets/ 的安装包（默认没有）
         bundled = installer.reassemble_bundled(self.plugin_dir, state_dir, logger=self.logger)
         if not bundled:
             bundled = installer.find_bundled_installer(self.plugin_dir)
         if bundled:
-            self.logger.info("使用仓库自带的 BiliLearn 安装包：%s", bundled.name)
+            self.logger.info("使用本地离线兜底安装包：%s", bundled.name)
             exe = installer.ensure_runtime_exe(bundled, state_dir, logger=self.logger)
             if exe:
                 return str(exe)
@@ -413,7 +413,9 @@ class BiliLearnBridgePlugin(NekoPluginBase):
         """以无头模式拉起 exe（立即返回，不等待就绪）。"""
         mode = self.launch_mode if self.launch_mode in ("serve", "silent") else "serve"
         env = os.environ.copy()
-        env["WEB_PORT"] = str(self.port)
+        # 用实际生效端口，而不是配置端口：账户模式下面板会以 accounts.json
+        # 里记录的端口为准，两者不一致时用配置端口会让本次拉起与随后的连接错位。
+        env["WEB_PORT"] = str(self._effective_port)
         # 即便面板自身有自动弹出逻辑也强制关闭（双保险）
         env["BILI_WEB_AUTO_OPEN"] = "0"
         # 已确认免责声明（终端层）：面板仍要求浏览器侧确认，由 client 自动完成
@@ -496,7 +498,7 @@ class BiliLearnBridgePlugin(NekoPluginBase):
         exe = await self._ensure_exe()
         if not exe:
             return Err(SdkError(
-                "未找到 BiliLearn（自带包缺失、自动下载失败且本地未安装）；"
+                "未找到 BiliLearn（自动下载失败且本地未安装）；"
                 "请在插件配置 exe_path 手动指定，或检查网络后重试。"
             ))
         self._effective_port = self._discover_port()
