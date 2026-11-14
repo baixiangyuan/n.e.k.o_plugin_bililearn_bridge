@@ -277,42 +277,35 @@ def expected_sha256(version: str) -> str | None:
     return KNOWN_INSTALLER_SHA256.get(version)
 
 
+# 代理可用性探测结果缓存：一次下载会走多个源与重试，没必要每次重探。
+_PROXY_USABLE: bool | None = None
+
+
 def _system_proxy_usable(timeout: float = 4.0) -> bool:
-    """系统代理环境变量指向的代理是否真的能转发请求。
+    """系统代理环境变量指向的代理是否真的能转发请求（结果按进程缓存）。
 
     只测 TCP 连通是不够的：本机环境里 ``HTTPS_PROXY=http://127.0.0.1:7892``
     的端口能 accept 连接，但通过它发请求仍然 ``WinError 10061``
     （代理进程其实已经不出国了）。所以这里真的发一次最轻量的请求去试，
-    用毫秒级超时判定，避免在错误的策略上白等几十秒 SSL 超时。
+    用极短超时判定，避免在错误的策略上白等几十秒 SSL 超时。
     """
+    global _PROXY_USABLE
+    if _PROXY_USABLE is not None:
+        return _PROXY_USABLE
     proxies = urllib.request.getproxies()
     if not any(proxies.get(scheme) for scheme in ("https", "http")):
+        _PROXY_USABLE = False
         return False
     request = urllib.request.Request(_PROBE_URL, headers={"User-Agent": _USER_AGENT})
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - 探测
-            return 200 <= response.status < 400
+            _PROXY_USABLE = 200 <= response.status < 400
     except urllib.error.HTTPError:
         # 有 HTTP 响应就说明代理在工作（4xx/5xx 是目标站的问题，不是代理的问题）。
-        return True
+        _PROXY_USABLE = True
     except (OSError, urllib.error.URLError, ValueError):
-        return False
-
-
-def _http_get(url: str, timeout: float = 30.0) -> bytes:
-    """GET 一个 URL 并返回原始字节。
-
-    策略：系统代理可用就走代理，否则直连。反向也能跑通，但直连失败时
-    SSL 握手要等满超时才报错，在代理已死的机器上每个源都要白等一次，
-    所以先用一次毫秒级 TCP 探测决定走哪条路。
-    """
-    request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT, "Accept": "*/*"})
-    if _system_proxy_usable():
-        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - 固定域名
-            return response.read()
-    direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with direct.open(request, timeout=timeout) as response:  # noqa: S310 - 固定域名
-        return response.read()
+        _PROXY_USABLE = False
+    return _PROXY_USABLE
 
 
 def _mirror_urls(url: str) -> list[tuple[str, str]]:
@@ -321,7 +314,7 @@ def _mirror_urls(url: str) -> list[tuple[str, str]]:
 
 
 def _open_stream(url: str, timeout: float):
-    """打开一个下载流：系统代理可用就走代理，否则直连（同 :func:`_http_get`）。"""
+    """打开一个下载流：系统代理可用就走代理，否则直连。"""
     request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
     if _system_proxy_usable():
         return urllib.request.urlopen(request, timeout=timeout)  # noqa: S310 - 镜像白名单

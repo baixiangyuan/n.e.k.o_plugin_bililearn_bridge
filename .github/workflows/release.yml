@@ -5,8 +5,14 @@ on:
     tags:
       - "v*"
 
+# 必须与上游可复用工作流声明的权限一致：它在发布 job 里用了
+# id-token 与 attestations（构建来源证明）。调用方若只给 contents: write，
+# GitHub 会把未列出的权限置为 none，导致整条工作流在启动阶段
+# 直接 startup_failure（v2.0.3 首次发布就是这么失败的）。
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 jobs:
   release:
